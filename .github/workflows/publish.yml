@@ -41,6 +41,16 @@ jobs:
             exit 1
           fi
       - name: Publish
-        # Trusted Publishing (OIDC): no NODE_AUTH_TOKEN — npm authenticates via
-        # the OIDC token from the workflow's id-token permission.
-        run: npm publish --provenance --access public
+        # Idempotent: a version already live on the registry (e.g. published
+        # manually before the tag push) is skipped, not retried — otherwise the
+        # run fails on 'cannot publish over existing version'. Unpublished
+        # versions still publish via Trusted Publishing (OIDC): no
+        # NODE_AUTH_TOKEN — npm authenticates via the workflow's id-token.
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if npm view "$PKG_NAME@$PKG_VERSION" version >/dev/null 2>&1; then
+            echo "$PKG_NAME@$PKG_VERSION already published — skipping npm publish"
+          else
+            npm publish --provenance --access public
+          fi
