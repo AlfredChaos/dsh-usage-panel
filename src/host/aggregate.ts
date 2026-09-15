@@ -12,7 +12,7 @@ import {
   totalsFrom,
   totalsFromModels,
 } from '../shared/usage.ts'
-import { recentOf, type UsagePanelState } from './projection.ts'
+import { flattenEpochs, recentOf, selectEpochs, type UsagePanelState } from './projection.ts'
 
 export interface SessionAgg {
   id: string
@@ -59,11 +59,23 @@ export function emptyAggregate(): Aggregate {
   }
 }
 
-/** Merge one session's projection value into the aggregate (pure). */
-export function mergeSessionValue(a: Aggregate, value: UsagePanelState, sessionId: string, now: number, depth = 0): Aggregate {
+/**
+ * Merge one session's projection value into the aggregate (pure).
+ *
+ * `inheritedEventCount` is the durable fork boundary (the snapshot's
+ * inheritedEventCount, or header.seedLength on older formats): epochs closed
+ * at or before it are the inherited prefix and are dropped; resume epochs
+ * (markers without a seed) are kept whole. `depth` is
+ * header.delegationDepth ?? 0 — session counts only include main sessions
+ * (what the user sees in the session list); subagent usage still feeds the
+ * token aggregates and the coverage split.
+ */
+export function mergeSessionValue(a: Aggregate, value: UsagePanelState, sessionId: string, now: number, depth = 0, inheritedEventCount = 0, archived = false): Aggregate {
   const cutoffKey = dayKeyUTC(now - RECENT_DAYS * 24 * 3600 * 1000)
-  const recent = recentOf(value, cutoffKey)
-  const totals = totalsFrom(value.totals)
+  const epochs = selectEpochs(value, inheritedEventCount)
+  const flat = flattenEpochs(epochs)
+  const recent = recentOf(epochs, cutoffKey)
+  const totals = totalsFrom(flat.totals)
   const next: Aggregate = {
     ...a,
     allTimeTotals: {
@@ -85,24 +97,24 @@ export function mergeSessionValue(a: Aggregate, value: UsagePanelState, sessionI
         recent.totals.cacheRead +
         recent.totals.cacheWrite,
     },
-    retries: a.retries + value.retries,
-    compactionTokens: a.compactionTokens + value.compactionTokens,
-    from: a.from === null ? value.firstTime : value.firstTime === null ? a.from : Math.min(a.from, value.firstTime),
-    to: a.to === null ? value.lastTime : value.lastTime === null ? a.to : Math.max(a.to, value.lastTime),
+    retries: a.retries + flat.retries,
+    compactionTokens: a.compactionTokens + flat.compactionTokens,
+    from: a.from === null ? flat.firstTime : flat.firstTime === null ? a.from : Math.min(a.from, flat.firstTime),
+    to: a.to === null ? flat.lastTime : flat.lastTime === null ? a.to : Math.max(a.to, flat.lastTime),
   }
   // Merge nested maps with clone-on-write.
-  for (const model of Object.keys(value.byModel)) {
-    const b = value.byModel[model]!
+  for (const model of Object.keys(flat.byModel)) {
+    const b = flat.byModel[model]!
     const cur = next.allTimeByModel[model]
     next.allTimeByModel[model] = cur ? mergeB(cur, b) : { ...b }
   }
-  for (const provider of Object.keys(value.byProvider)) {
-    const b = value.byProvider[provider]!
+  for (const provider of Object.keys(flat.byProvider)) {
+    const b = flat.byProvider[provider]!
     const cur = next.allTimeByProvider[provider]
     next.allTimeByProvider[provider] = cur ? mergeB(cur, b) : { ...b }
   }
-  for (const day of Object.keys(value.byDay)) {
-    const dayMap = value.byDay[day]!
+  for (const day of Object.keys(flat.byDay)) {
+    const dayMap = flat.byDay[day]!
     const target = next.byDay[day] || (next.byDay[day] = {})
     for (const model of Object.keys(dayMap)) {
       const b = dayMap[model]!
@@ -115,14 +127,19 @@ export function mergeSessionValue(a: Aggregate, value: UsagePanelState, sessionI
     const cur = next.recentByModel[model]
     next.recentByModel[model] = cur ? mergeB(cur, b) : { ...b }
   }
-  if (recent.totals.input + recent.totals.output + recent.totals.cacheRead + recent.totals.cacheWrite > 0) {
+  // Session counters mirror the sidebar list: every readable main session
+  // counts (even one that never spent a token); archived and subagent
+  // sessions are sidebar-invisible so they feed token totals only.
+  const countsAsMain = depth === 0 && !archived
+  const hasRecentUsage = recent.totals.input + recent.totals.output + recent.totals.cacheRead + recent.totals.cacheWrite > 0
+  if (countsAsMain) next.allTimeSessionCount += 1
+  if (hasRecentUsage && countsAsMain) {
     next.recentSessionCount += 1
   }
   if (totals.total > 0) {
-    next.allTimeSessionCount += 1
     if (depth > 0) next.usageSessionsSubagent += 1
-    else next.usageSessionsMain += 1
-    next.sessions.push({ id: sessionId, totals, lastActive: value.lastTime ?? 0, depth })
+    else if (countsAsMain) next.usageSessionsMain += 1
+    next.sessions.push({ id: sessionId, totals, lastActive: flat.lastTime ?? 0, depth })
   }
   return next
 }

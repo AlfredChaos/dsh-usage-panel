@@ -1,5 +1,6 @@
-export declare const RPC_CHANNEL = "/usage-stats";
-export declare const RPC_OVERVIEW = "overview";
+export declare const RPC_CHANNEL = "/api";
+export declare const RPC_OVERVIEW = "usage-stats/overview";
+export declare const RPC_PATH = "/api/usage-stats/overview";
 /** Machine-readable error codes — the host never returns human prose. */
 export type ErrorCode = 'internal' | 'bad-request' | 'scan-failed' | 'service-unavailable';
 export interface RpcError {

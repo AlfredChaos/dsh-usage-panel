@@ -3,8 +3,12 @@
 // payload shape twice. Day keys are UTC (YYYY-MM-DD) — see README for the
 // timezone declaration.
 
-export const RPC_CHANNEL = '/usage-stats'
-export const RPC_OVERVIEW = 'overview'
+// dsh ≥0.1.5 transport: all browser traffic shares the /api prefix route
+// (Host/Origin fence + browser auth). The host registers an exact fetch
+// route; the client reaches it through the shared '/api' RPC channel.
+export const RPC_CHANNEL = '/api'
+export const RPC_OVERVIEW = 'usage-stats/overview'
+export const RPC_PATH = '/api/usage-stats/overview'
 
 /** Machine-readable error codes — the host never returns human prose. */
 export type ErrorCode = 'internal' | 'bad-request' | 'scan-failed' | 'service-unavailable'

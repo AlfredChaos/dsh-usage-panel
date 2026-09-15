@@ -8,7 +8,7 @@
 // field whitelist.
 import type { RpcResultLike } from './ctx.ts'
 import type { Overview } from '../shared/contract.ts'
-import { OVERVIEW_VERSION, type RpcResult } from '../shared/contract.ts'
+import { OVERVIEW_VERSION, RPC_CHANNEL, RPC_OVERVIEW, type RpcResult } from '../shared/contract.ts'
 
 const CACHE_KEY = 'dsh-usage-panel:overview:v' + OVERVIEW_VERSION
 
@@ -72,7 +72,7 @@ export async function callOverview(
   rpc: { call(channel: string, endpoint: string, payload?: unknown): Promise<RpcResultLike<unknown>> },
   force: boolean,
 ): Promise<Overview> {
-  const res = (await rpc.call('/usage-stats', 'overview', { force: !!force })) as RpcResult<Overview>
+  const res = (await rpc.call(RPC_CHANNEL, RPC_OVERVIEW, { force: !!force })) as RpcResult<Overview>
   if (res && res.ok) return res.value
   const code = res && res.error ? res.error.code : 'internal'
   const message = res && res.error ? res.error.message : 'unknown error'

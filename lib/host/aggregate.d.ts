@@ -24,8 +24,18 @@ export interface Aggregate {
     sessions: SessionAgg[];
 }
 export declare function emptyAggregate(): Aggregate;
-/** Merge one session's projection value into the aggregate (pure). */
-export declare function mergeSessionValue(a: Aggregate, value: UsagePanelState, sessionId: string, now: number, depth?: number): Aggregate;
+/**
+ * Merge one session's projection value into the aggregate (pure).
+ *
+ * `inheritedEventCount` is the durable fork boundary (the snapshot's
+ * inheritedEventCount, or header.seedLength on older formats): epochs closed
+ * at or before it are the inherited prefix and are dropped; resume epochs
+ * (markers without a seed) are kept whole. `depth` is
+ * header.delegationDepth ?? 0 — session counts only include main sessions
+ * (what the user sees in the session list); subagent usage still feeds the
+ * token aggregates and the coverage split.
+ */
+export declare function mergeSessionValue(a: Aggregate, value: UsagePanelState, sessionId: string, now: number, depth?: number, inheritedEventCount?: number, archived?: boolean): Aggregate;
 export declare function rankSessions(sessions: SessionAgg[], limit: number): SessionAgg[];
 export interface FinalizeInput {
     aggregate: Aggregate;

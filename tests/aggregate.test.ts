@@ -41,8 +41,10 @@ test('mergeSessionValue aggregates totals, sessions and providers across session
 
   assert.equal(a.allTimeTotals.input, 1150)
   assert.equal(a.recentTotals.input, 150) // 08-14 + 08-15 only (30-day window)
-  assert.equal(a.recentSessionCount, 2)
-  assert.equal(a.allTimeSessionCount, 2)
+  // Session counts are main-only (delegationDepth === 0); subagent usage
+  // still feeds the token aggregates and the coverage split.
+  assert.equal(a.recentSessionCount, 1)
+  assert.equal(a.allTimeSessionCount, 1)
   assert.equal(a.allTimeByModel['m1']?.input, 1100)
   assert.equal(a.allTimeByModel['m2']?.input, 50)
   assert.equal(a.allTimeByProvider['p1']?.input, 1150)
@@ -87,8 +89,8 @@ test('finalizeOverview builds the wire payload with coverage, titles and provide
   assert.equal(overview.days.length, HEAT_DAYS)
   assert.equal(overview.days[HEAT_DAYS - 1]!.date, '2026-08-15')
   assert.equal(overview.totals.input, 150)
-  assert.equal(overview.sessionCount, 2)
-  assert.equal(overview.allTime.sessionCount, 2)
+  assert.equal(overview.sessionCount, 1)
+  assert.equal(overview.allTime.sessionCount, 1)
   assert.deepEqual(
     overview.byModel.map((m) => m.model),
     ['m1', 'm2'],
@@ -108,6 +110,44 @@ test('finalizeOverview builds the wire payload with coverage, titles and provide
   assert.equal(overview.providers.length, 1)
   assert.equal(overview.providers[0]!.name, 'DeepSeek')
   assert.equal(overview.updatedAt, NOW)
+})
+
+test('mergeSessionValue drops seed-prefix epochs via seedLength, keeps resume epochs', () => {
+  // Layout: [seed prefix w/ parent resume marker][fork marker][own w0][own resume][own w1]
+  const events = [
+    ev('assistant/message', 1, Date.UTC(2026, 7, 14), { turn: 1, step: 1, usage: usage(50) }),
+    ev('step/end', 2, Date.UTC(2026, 7, 14), { turn: 1, step: 1 }),
+    ev('session/end-seed', 3, Date.UTC(2026, 7, 14), {}), // parent's resume marker inside seed
+    ev('assistant/message', 4, Date.UTC(2026, 7, 14), { turn: 2, step: 1, usage: usage(40) }),
+    ev('step/end', 5, Date.UTC(2026, 7, 14), { turn: 2, step: 1 }),
+    ev('session/end-seed', 6, Date.UTC(2026, 7, 14), {}), // fork boundary → seedLength = 6
+    ev('assistant/message', 7, Date.UTC(2026, 7, 15), { turn: 3, step: 1, usage: usage(30) }),
+    ev('step/end', 8, Date.UTC(2026, 7, 15), { turn: 3, step: 1 }),
+    ev('session/end-seed', 9, Date.UTC(2026, 7, 15), {}), // child's own resume marker
+    ev('assistant/message', 10, Date.UTC(2026, 7, 15), { turn: 4, step: 1, usage: usage(20) }),
+    ev('step/end', 11, Date.UTC(2026, 7, 15), { turn: 4, step: 1 }),
+  ]
+  const a = mergeSessionValue(emptyAggregate(), foldEvents(events), 'sess', NOW, 0, 6)
+  assert.equal(a.allTimeTotals.input, 50) // 30 + 20 own usage; 90 of prefix dropped
+  assert.equal(a.allTimeSessionCount, 1)
+  assert.equal(a.recentTotals.input, 50)
+})
+
+test('sessionCount mirrors the sidebar: empty mains count, archived mains do not', () => {
+  let a = emptyAggregate()
+  // A used main session.
+  a = mergeSessionValue(a, foldEvents(sessionLog([{ day: 14, input: 100 }])), 'sess-used', NOW, 0)
+  // An empty main session (created, never sent a message): sidebar-visible.
+  a = mergeSessionValue(a, foldEvents([]), 'sess-empty', NOW, 0)
+  // An archived session with real usage: sidebar-hidden → KPI invisible,
+  // but its spend still feeds token totals and the top-session ranking.
+  a = mergeSessionValue(a, foldEvents(sessionLog([{ day: 15, input: 200 }])), 'sess-archived', NOW, 0, 0, true)
+
+  assert.equal(a.allTimeSessionCount, 2) // used + empty; archived excluded
+  assert.equal(a.usageSessionsMain, 1) // archived spend is not sidebar-visible
+  assert.equal(a.recentSessionCount, 1)
+  assert.equal(a.allTimeTotals.input, 300) // archived tokens still aggregate
+  assert.equal(a.sessions.length, 2) // topSessions ranks real spend, archived included
 })
 
 test('finalizeOverview on an empty aggregate yields a zero overview (mode none)', () => {

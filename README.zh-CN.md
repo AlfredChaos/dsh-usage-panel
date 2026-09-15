@@ -12,7 +12,7 @@
 
 ## 页面内容
 
-- **汇总数据（全部历史）** —— 计费输入 / 输出 Token、会话数量（次级标注总会话数与主/子代理用量拆分）、最常用模型及其占比。
+- **汇总数据（全部历史）** —— 计费输入 / 输出 Token、主会话数量（`delegationDepth === 0`，与可见会话列表口径严格一致：零用量会话计入、已归档会话不计；次级标注总会话数与主/子代理用量拆分）、最常用模型及其占比。
 - **缓存命中率** —— `缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）`，附读写绝对量。
 - **活跃热力图** —— 最近半年，GitHub 贡献图式布局（列为周、行为星期）。按非零日用量的四分位分 4 级色阶。
 - **每日柱状图** —— 按模型堆叠的每日用量，可切换最近 7 / 14 / 30 天。
@@ -57,7 +57,7 @@ Host 半聚合持久化会话日志：
 
 记账规则：`request/header` 与 `request/context` 记录模型（context 打底、header 覆盖）；该步骤的 `assistant/message` 用量**替换**流式暂记用量（同一步重试的消息不会重复累计）；`llm/retry` 事件只计重试次数、不计 Token；`compaction/summary` 用量归属其自身模型并单独披露；reasoning token 已含于 output，绝不重复相加。
 
-**子会话（fork）去重**：最后一个 `session/end-seed` 标记之前的事件（fork / resume / replay 种子历史）一律不计数，fork 出的会话不会重复计算父会话的用量。
+**子会话（fork）去重**：继承前缀（`inheritedEventCount`）之内的事件一律不计数，fork 出的会话不会重复计算父会话的用量。`session/end-seed` 标记只用于切分 resume/fork 记账窗口（epoch）——被 resume 的会话，自己所有窗口的用量都会保留。
 
 **日期口径声明**：日桶与导出均按 **UTC** 自然日（`YYYY-MM-DD`）。热力图副标题明确标注口径（"最近半年 · UTC"）。
 
@@ -84,7 +84,7 @@ Host 半聚合持久化会话日志：
 | `src/shared/contract.ts` | host↔client wire 契约（单一来源） |
 | `cordis.patch.yml` | Bundle patch：向 profile 组合插入 `usage-stats` 行 |
 
-Host 通过 `ctx.connection.rpc.handle('/usage-stats', …, { authority: 'loopback' })` 提供 `overview` 端点，浏览器经 `rpc.call('/usage-stats', 'overview', …)` 调用。overview 载荷包含 `coverage`（总会话数与主/子代理用量拆分，展示于会话数量 KPI 次级文字）、`topSessions`、`providers`，并保留 v0.1.0 形态的 `days` / `totals` / `byModel` / `allTime`。基于 DeepSeek Harness `0.1.0-rc.6` 开发验证。测试使用 Node 内置 test runner（`npm test`）；CI 执行 typecheck + build + test + 打包门禁。
+Host 通过共享 `/api` 传输上的精确路径路由提供 `overview` 端点（`ctx.connection.fetch.register('/api/usage-stats/overview', …)`——由 connection 插件的路由统一做 Host/Origin 检查与浏览器鉴权）；浏览器经 `rpc.call('/api', 'usage-stats/overview', …)` 调用。overview 载荷包含 `coverage`（总会话数与主/子代理用量拆分，展示于会话数量 KPI 次级文字）、`topSessions`、`providers`，并保留 v0.1.0 形态的 `days` / `totals` / `byModel` / `allTime`。基于 DeepSeek Harness `0.1.5-rc.1` 开发验证。测试使用 Node 内置 test runner（`npm test`）；CI 执行 typecheck + build + test + 打包门禁。
 
 ## License
 

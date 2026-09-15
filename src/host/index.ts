@@ -15,11 +15,11 @@ import type { SessionQueryEngine, SessionRecord } from '@deepseek-ai/dsh-session
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
 import type { SessionProjectionCache } from '@deepseek-ai/dsh-session-projection-cache'
-import { RPC_CHANNEL, RPC_OVERVIEW, type CoverageStats, type Overview, type RpcResult } from '../shared/contract.ts'
+import { RPC_OVERVIEW, RPC_PATH, type CoverageStats, type Overview, type RpcResult } from '../shared/contract.ts'
 import { emptyAggregate, emptyOverview, finalizeOverview, mergeSessionValue, rankSessions } from './aggregate.ts'
 import { usagePanelProjectionDefinition } from './projection-unit.ts'
 import { scanFallback } from './scan.ts'
-import type { HostConnection, HostLlm } from './types.ts'
+import type { HostConnection, HostLlm, HostWorkspaceRegistry } from './types.ts'
 
 export const name = 'dsh-usage-panel'
 export const inject = ['timer', 'connection']
@@ -34,6 +34,28 @@ export function apply(ctx: Context): void {
   const projCache = ctx.get('sessionProjectionCache') as SessionProjectionCache | undefined
   const connection = ctx.get('connection') as HostConnection | undefined
   const llm = ctx.get('llm') as HostLlm | undefined
+  // workspaceRegistry is lazily activated: declaring it via ctx.inject spawns
+  // a child fiber that runs once the service is provided (it may only appear
+  // after the API controllers wake). Until then the archive set stays empty.
+  let workspaceRegistry: HostWorkspaceRegistry | undefined
+  let markRegistryReady: () => void = () => { }
+  const registryReady = new Promise<void>((resolve) => {
+    markRegistryReady = resolve
+  })
+  ctx.inject(['workspaceRegistry'], (regCtx) => {
+    workspaceRegistry = (regCtx as unknown as { workspaceRegistry?: HostWorkspaceRegistry }).workspaceRegistry
+    console.log(tag, 'workspaceRegistry resolved: archivedSessionIds=' + (workspaceRegistry?.archivedSessionIds.length ?? 0))
+    markRegistryReady()
+  })
+  // The first scan races that lazy activation: wait until the inject callback
+  // has actually run (the Fiber promise itself settles early, on creation),
+  // bounded so absent profiles never block the overview.
+  let registryWaited = false
+  async function awaitRegistryOnce(): Promise<void> {
+    if (registryWaited) return
+    registryWaited = true
+    await Promise.race([registryReady, new Promise((r) => setTimeout(r, 1500))])
+  }
 
   let mode: CoverageStats['mode'] =
     registry && projCache && sq ? 'projection' : sq ? 'scan' : 'none'
@@ -74,8 +96,15 @@ export function apply(ctx: Context): void {
     console.warn(tag, message)
   }
 
+  // Archive state can change between scans — rebuild the set per pass so a
+  // just-archived session drops out of the KPI on the next overview.
+  function archivedSet(): Set<string> {
+    return new Set((workspaceRegistry?.archivedSessionIds ?? []).map(String))
+  }
+
   async function scanProjection(now: number): Promise<Overview> {
     let a = emptyAggregate()
+    const archived = archivedSet()
     let sessionsTotal = 0
     let sessionsOk = 0
     let sessionsFailed = 0
@@ -102,13 +131,18 @@ export function apply(ctx: Context): void {
         continue
       }
       try {
-        const snap = await projCache!.coldSnapshot(id)
-        const value = snap.values.usagePanel
+        // dsh ≥0.1.5: coldSnapshot takes the caller-supplied complete log
+        // (meta + inheritedEventCount + events) — read it via sessionQuery.
+        const snap = await sq!.readSession(id)
+        const projected = projCache!.coldSnapshot(snap.session, snap.inheritedEventCount, snap.events)
+        const value = projected.values.usagePanel
         if (!value) {
           sessionsPending += 1 // cell not folded yet (no events / cold)
           continue
         }
-        a = mergeSessionValue(a, value, id, now)
+        const depth = Number((header as { delegationDepth?: unknown }).delegationDepth) || 0
+        const inherited = Number(snap.inheritedEventCount) || 0
+        a = mergeSessionValue(a, value, id, now, depth, inherited, archived.has(String(id)))
         sessionsOk += 1
       } catch (err) {
         sessionsFailed += 1
@@ -149,8 +183,9 @@ export function apply(ctx: Context): void {
       console.log(tag, 'sessionQuery unavailable; returning empty overview')
       return emptyOverview(now)
     }
+    await awaitRegistryOnce()
     if (mode === 'projection') return scanProjection(now)
-    return scanFallback({ sq: sq!, providerNames, logFailure }, now)
+    return scanFallback({ sq: sq!, providerNames, logFailure, isArchived: (id) => archivedSet().has(id) }, now)
   }
 
   function startScan(): Promise<Overview> {
@@ -161,7 +196,7 @@ export function apply(ctx: Context): void {
       return payload
     })
     inflight = run
-    run.catch(() => {}).then(() => {
+    run.catch(() => { }).then(() => {
       if (inflight === run) inflight = null
     })
     return run
@@ -177,32 +212,42 @@ export function apply(ctx: Context): void {
     return startScan()
   }
 
-  // RPC channel for the browser half: /usage-stats/overview.
+  // RPC endpoint for the browser half: POST /api/usage-stats/overview on the
+  // shared /api transport (Host/Origin fence + browser auth applied by the
+  // connection plugin's route). The connection envelope (client-request /
+  // server-response, rpcId echo) is what the client's rpc.call expects.
   const disposeRpc =
     connection &&
-    connection.rpc.handle(
-      RPC_CHANNEL,
-      (endpoint, payload): Promise<RpcResult<Overview>> => {
-        if (endpoint === RPC_OVERVIEW) {
-          return overview(payload as { force?: boolean } | undefined).then(
-            (value) => ({ ok: true, value }),
-            (err) => ({
-              ok: false,
-              error: {
-                code: 'internal',
-                message: String((err as Error)?.message ?? err),
-                details: {},
-              },
-            }),
-          )
+    connection.fetch.register({
+      path: RPC_PATH,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        const message = (await request.json().catch(() => undefined)) as
+          | { type?: unknown; rpcId?: unknown; method?: unknown; payload?: unknown }
+          | undefined
+        if (!message || message.type !== 'client-request' || typeof message.rpcId !== 'string') {
+          return new Response('bad request', { status: 400 })
         }
-        return Promise.resolve({
-          ok: false,
-          error: { code: 'bad-request', message: 'unknown endpoint: ' + String(endpoint), details: { issues: [] } },
-        })
+        const respond = (result: RpcResult<Overview>) =>
+          Response.json({ type: 'server-response', rpcId: message.rpcId, result })
+        if (message.method !== RPC_OVERVIEW) {
+          return respond({
+            ok: false,
+            error: { code: 'bad-request', message: 'unknown endpoint: ' + String(message.method), details: { issues: [] } },
+          })
+        }
+        return respond(
+          await overview(message.payload as { force?: boolean } | undefined).then(
+            (value): RpcResult<Overview> => ({ ok: true, value }),
+            (err): RpcResult<Overview> => ({
+              ok: false,
+              error: { code: 'internal', message: String((err as Error)?.message ?? err), details: {} },
+            }),
+          ),
+        )
       },
-      { authority: 'loopback' },
-    )
+    })
 
   // Warm up the moment the plugin loads.
   startScan().then((o) => {

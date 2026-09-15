@@ -2,9 +2,10 @@
 //
 // Used when the sessionProjections / sessionProjectionCache services are
 // unavailable: replays every session log through the SAME pure reducer as the
-// projection path (single accounting core), with the v0.1.0 fork boundary
-// (header.seedLength) synthesized as a virtual session/end-seed when the log
-// lacks the marker. Coverage counters replace the old silent `continue`.
+// projection path (single accounting core). Unlike the registry cold fold —
+// which can't see the header — this path owns it: header.seedLength is
+// preset as the authoritative seed boundary (v0.1.0 semantics), and markers
+// only split epochs. Coverage counters replace the old silent `continue`.
 import type { SessionQueryEngine, SessionRecord } from '@deepseek-ai/dsh-session-query'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 // Type-only imports that load the event-map augmentations for merged types.
@@ -19,16 +20,25 @@ export interface ScanFallbackDeps {
   sq: SessionQueryEngine
   providerNames: Record<string, string>
   logFailure: (message: string) => void
+  /** Sidebar visibility: archived sessions feed totals but never the KPI. */
+  isArchived: (sessionId: string) => boolean
 }
 
 /** True for events the reducer will count (post-seed usage / retry). */
-function isCountedEvent(state: { seedEnd: number | null }, event: SessionEvent): boolean {
-  if (state.seedEnd === null || event.seq < state.seedEnd) return false
+function isCountedEvent(seedLength: number, event: SessionEvent): boolean {
+  if (event.seq <= seedLength) return false
+  // Pre-0.1.5 logs may carry streamed chunks; matched by string like the reducer.
+  if ((event.type as string) === 'assistant/chunk') {
+    const chunk = (event.data as { chunk?: { type?: string; usage?: unknown } }).chunk
+    return !!chunk && chunk.type === 'usage' && !!chunk.usage
+  }
   switch (event.type) {
     case 'assistant/message':
       return !!event.data.usage
-    case 'assistant/chunk':
-      return !!event.data.chunk && event.data.chunk.type === 'usage' && !!event.data.chunk.usage
+    case 'assistant/attempt':
+      return (event.data.stream ?? []).some(
+        (rec) => rec.type === 'chunk' && rec.chunk.type === 'usage' && !!rec.chunk.usage,
+      )
     case 'compaction/summary':
       return !!event.data.usage
     case 'llm/retry':
@@ -39,7 +49,7 @@ function isCountedEvent(state: { seedEnd: number | null }, event: SessionEvent):
 }
 
 export async function scanFallback(deps: ScanFallbackDeps, now: number): Promise<Overview> {
-  const { sq, providerNames, logFailure } = deps
+  const { sq, providerNames, logFailure, isArchived } = deps
   let a: Aggregate = emptyAggregate()
   const titles = new Map<string, string | null>()
   let sessionsTotal = 0
@@ -88,23 +98,18 @@ export async function scanFallback(deps: ScanFallbackDeps, now: number): Promise
       logFailure('readSession ' + sessionId + ' failed: ' + String((err as Error)?.message ?? err))
       continue
     }
-    const events = snapshot && snapshot.events
-    if (!events || !events.length) {
-      sessionsOk += 1
-      continue
-    }
+    const events = (snapshot && snapshot.events) || []
 
-    const seedLength = Number((header as { seedLength?: unknown }).seedLength) || 0
-    // Fork boundary, v0.1.0 semantics: seed events occupy seq 1..seedLength.
-    // The last session/end-seed marker is authoritative when present; the
-    // seedLength-derived boundary covers older logs without a marker; a log
-    // with neither counts everything (fresh session).
-    let seedEnd = 0
-    for (const event of events) {
-      if (event.type === 'session/end-seed') seedEnd = event.seq
-    }
-    if (seedEnd === 0 && seedLength > 0) seedEnd = seedLength + 1
-    let state: UsagePanelState = { ...initState(), seedEnd }
+    // Fork boundary: the snapshot's inheritedEventCount (≥0.1.5) is the
+    // authoritative inherited-prefix length; header.seedLength covers older
+    // formats. Seed events occupy seq 0..inherited-1. The boundary is preset
+    // so seed usage never reaches an epoch; session/end-seed markers inside
+    // the log only split epochs (resume boundaries).
+    const inherited =
+      Number((snapshot as { inheritedEventCount?: unknown } | null)?.inheritedEventCount) ||
+      Number((header as { seedLength?: unknown }).seedLength) ||
+      0
+    let state: UsagePanelState = { ...initState(), seedEnd: inherited > 0 ? inherited + 1 : null }
 
     let title: string | null = null
     for (const event of events) {
@@ -112,13 +117,13 @@ export async function scanFallback(deps: ScanFallbackDeps, now: number): Promise
         title = event.data.title
         // Fall through to the reducer (uninterested → same reference).
       }
-      if (isCountedEvent(state, event)) eventsCounted += 1
+      if (isCountedEvent(inherited, event)) eventsCounted += 1
       state = applyEvent(state, event)
     }
     titles.set(sessionId, title)
     // mergeSessionValue is pure — the returned aggregate replaces the old one.
     const depth = Number((header as { delegationDepth?: unknown }).delegationDepth) || 0
-    a = mergeSessionValue(a, state, sessionId, now, depth)
+    a = mergeSessionValue(a, state, sessionId, now, depth, inherited, isArchived(sessionId))
     sessionsOk += 1
   }
 

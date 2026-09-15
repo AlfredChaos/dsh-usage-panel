@@ -44,13 +44,13 @@ npm pack --dry-run   # 发布前人工确认清单
 
 ## 5. 正确性红线（本项目的壁垒，任何重构不得破坏）
 
-1. **fork 去重**：`header.seedLength` 之后的 `assistant/message` 才计数（竞品 dashboard 无此逻辑会重复计费）。
+1. **fork 去重**：继承前缀（snapshot `inheritedEventCount`，旧格式 `header.seedLength`）之后的 `assistant/message`/`assistant/attempt` 才计数（竞品 dashboard 无此逻辑会重复计费）。
 2. **双源模型归因**：`request/context.model` 打底，`request/header.config.model` 覆盖。
 3. **四桶记账**：input/output/cacheRead/cacheWrite 分开；v0.2.0 起升级为落盘投影后：流式 `assistant/chunk` 的 provisional usage 必须被最终 `assistant/message` 覆盖；`llm/retry` 独立计数；`compaction/summary` 独立归因；reasoning 已含于 output，不重复加。
 4. **日期口径 UTC**：dayKey 用 UTC 桶（v0.1.0 用本地时区，跨时区漂移），README 与 UI 必须显式声明口径。
 5. **只读承诺**：永不写回原始会话日志；投影机制的落盘是框架对派生缓存的落盘，不触碰原始日志。
-6. **安全边界**：RPC `{ authority: 'loopback' }`，不开放裸 HTTP 端口。
-7. **入口稳定**：`settings.section` id `usage-stats`、order 25、RPC 通道 `/usage-stats`——这些 id 被宿主配置引用，改名即破坏安装。
+6. **安全边界**：只经共享 `/api` 传输暴露端点（`connection.fetch.register` 精确路径，宿主统一做 Host/Origin 检查 + 浏览器鉴权），不开放裸 HTTP 端口。
+7. **入口稳定**：`settings.section` id `usage-stats`、order 25、RPC 端点 `usage-stats/overview`（`/api` 通道）——这些 id 被宿主配置引用，改名即破坏安装。
 
 ## 6. 踩坑记录（本项目真实踩过/分析确认的坑）
 
@@ -83,7 +83,19 @@ npm pack --dry-run   # 发布前人工确认清单
 - **locale 运行时的 `translate` 找不到键时"fail loud"返回键本身**：`translated(key) || 本地词典` 这类兜底会被"键本身"这个真值绕过，必须显式 `text === key` 判失败再走本地词典；且 `translated` 调用不要传 params（插值统一由我们做）。
 - **`i18n.locale` 必须是 getter**：字段快照在语言切换后保持旧值，格式化函数会一直用初始语言。
 - **`ctx.on('locale/change', …)` 直接挂在 ctx 上**（cordis Context 就是 EventEmitter，没有 `ctx.events`）；更稳的是挂 `locale.subscribe(update)`（切换与迟到词典注册都会 bump revision）。
-- **投影注册表的冷折叠是单趟**：`buildCell` = `init()` + 逐事件 `apply()`，无回看。种子边界因此用"武装"语义：看到最后一个 `session/end-seed` 之前**一律不计数**；`foldEvents`（自控路径）必须先预扫最后一个标记再折叠；`session/end-seed` 分支必须"last marker wins"（`seq <= seedEnd` 时保持原值），否则预置的 seedEnd 会被更早的标记覆盖。
+- **投影注册表的冷折叠是单趟**：`buildCell` = `init()` + 逐事件 `apply()`，无回看。
+- **`session/end-seed` 不是 fork 专属标记**：`Session` 构造器对任何种子（fork 前缀、resume 自回放）都会追加一条；被 resume N 次的会话有 N 条 marker，fork 的子日志里还会拷入父会话的 resume marker。因此 v0.2.0 起记账改为**按 marker 切 epoch**（marker 只定界、不做计数门控），`mergeSessionValue` 用继承前缀长度（0.1.5 `inheritedEventCount`，旧格式 `header.seedLength`）裁定丢哪些前缀 epoch——fork/seeded-subagent 丢前缀、resume 会话全保留、无 marker 会话全保留，projection 与 scan 双路径口径统一。**禁止**再用"首个/末个 marker"推断边界（首个 marker 会让 fork 重复计父历史，末个 marker 会让 resume 会话丢早期窗口——两种错法都真实踩过）。`session/end-seed` 分支必须先 `commitStep` 冲刷 open step 再关闭 epoch，否则跨边界的未完成 step 会漏进下一个 epoch。
+- **`mergeSessionValue` 需要 depth + inheritedEventCount + archived**：签名 `mergeSessionValue(a, value, sessionId, now, depth, inheritedEventCount, archived)`；`scanProjection`（index.ts）与 `scanAll`（scan.ts）都必须下传——漏传 depth 会让 `usageSessionsSubagent` 恒为 0，漏传前缀长度会让 fork 前缀计入，漏传 archived 会让已归档会话混入 KPI。
+- **sessionCount 口径 = 侧边栏可见列表**：计所有可读、`delegationDepth === 0` 且未归档的会话——**零用量（空）会话也计入**（merge 对空 state 也要被调用，scan 路径不得提前 `continue` 掉空日志）；已归档会话只喂 token 汇总与 topSessions。不变式：`usageSessionsMain ⊆ sessionCount`（前者是后者里有消耗的）。归档权威源是 `workspaceRegistry.archivedSessionIds`（SessionId 与 `header.id` 同为 `session-<uuid>` 形态，直接字符串匹配）。
+- **`workspaceRegistry` 是惰性激活服务，`ctx.get` 拿不到**：cordis 服务按 inject 声明激活——无人注入时 provider fiber 休眠，`ctx.get('workspaceRegistry')`（反射读，绕过 inject）恒 undefined。必须 `ctx.inject(['workspaceRegistry'], childCtx => …)` 建子 fiber 强制激活；服务不可用则子 fiber 休眠、插件不受影响。注意 `ctx.inject` 返回的 Fiber promise **创建即 settle**，不能用它等依赖就绪——首扫要在回调里置信号量再 `Promise.race(信号量, timeout)` 做有界等待。
+- **0.1.5 API 迁移（rc.6 → 0.1.5 实测踩坑）**：
+  - `header.seedLength` 已移除：`header.isSeeded` 标记 fork 世系，精确前缀长度改为快照/会话状态 `inheritedEventCount`（`readSession`/`SessionLogSnapshot`、corpus `load`、snapshot 各类观察对象都带它）。seedLength 语义 = 继承事件数 = cut，二者数值相同。
+  - `projCache.coldSnapshot(id)` → `coldSnapshot(meta, inheritedEventCount, events)`：服务不再自查 persistence，调用方必须先 `sq.readSession(id)` 拿完整日志。传错形状会得到 `SessionLogOffset must be a non-negative safe integer, got undefined`。
+  - **`connection.rpc.handle` 对第三方插件不可用**：`register` 内部访问 `owner.webServer`，而 owner 绑的是服务方 ctx（其 inject 无 webServer），必然 `cannot get property "webServer" without inject`。官方插件全走 `connection.fetch.register({path, methods, requestBody, fetch})`（exact path，挂在共享 `/api` 路由后，自动继承 Host/Origin + browserAuth 栅栏）或 `rpc.intercept`（仅 `/api` 通道）。迁移后需自己实现 connection envelope：`{type:'client-request',rpcId,method,payload}` → `{type:'server-response', rpcId, result:{ok,value}|{ok:false,error}}`。
+  - `assistant/chunk` 事件类型已从词表移除（不再持久化）；失败/重试调用结算为 `assistant/attempt {turn, step, stream: AssistantStreamRecord[]}`，usage 在 `stream[].chunk{type:'usage'}` 里。旧日志仍有 chunk 事件，按字符串匹配兼容。
+  - `dsh plugin --profile <p> remove <pkg>` 会同时清 dependencies 和 `dsh.profile.bundles` 条目；`add` 会一并恢复。pnpm `file:` 依赖是**拷贝**不是 symlink（改代码需重新 add）；`link:` 才是真 symlink。
+  - 第三方插件随宿主主版本漂移：`dsh-better-sidebar@0.12.x` 在 0.1.5 下因 `settingsNamespace` 导出缺失崩掉整个插件树，升 0.19.x（peer `^0.1.5-rc.1`）恢复。升级宿主后如插件树加载失败，先查各插件 peer 范围。
+  - rc.6 写的旧 subagent 日志（`subagent/descriptor` v2）会被 0.1.5 replay 校验拒绝（`unsupported descriptor version 2; source v0 artifact remains unchanged`）——框架层数据兼容问题，靠 coverage 披露而非插件侧修复。
 - **`mergeSessionValue` 是纯函数**：返回值必须重新赋值（`a = mergeSessionValue(a, …)`），漏掉会静默丢数据——scan.ts 与 index.ts 都踩过。
 - **zod v4 的 `z.record` 签名变了**：`z.record(valueSchema)` 在 v4 里被当作 key schema；必须 `z.record(z.string(), valueSchema)`。
 - **`SessionId` 是品牌类型**：`readSession/readTitle/coldSnapshot` 拒绝裸 `string`；用 `header.id` 本体，别 `String()`。

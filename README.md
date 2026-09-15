@@ -12,7 +12,7 @@ Token usage statistics for [DeepSeek Harness](https://github.com/deepseek-ai/dee
 
 ## What it shows
 
-- **Cumulative totals (all time)** — billed input / output tokens, session count (with the grand total of session records and the main/subagent usage split beneath it), and the most-used model with its share.
+- **Cumulative totals (all time)** — billed input / output tokens, main-session count (`delegationDepth === 0`, matching the visible session list exactly: zero-usage sessions count, archived ones do not; with the grand total of session records and the main/subagent usage split beneath it), and the most-used model with its share.
 - **Cache hit rate** — `cache read ÷ (uncached input + cache read + cache write)`, with the read/write magnitudes.
 - **Activity heatmap** — the last six months in a GitHub-contribution layout (weeks as columns, weekdays as rows). Days are colored by quartile over non-zero usage.
 - **Daily stacked bars** — per-model token usage, switchable between the last 7, 14, or 30 days.
@@ -57,7 +57,7 @@ The host half aggregates persisted session logs:
 
 Accounting rules: `request/header` and `request/context` events record the model (context base, header override); the step's `assistant/message` usage replaces streamed provisional usage (a retried same-step message never double-counts); `llm/retry` events are counted as retries, not tokens; `compaction/summary` usage is attributed to its own model and reported separately; reasoning tokens are already inside output and are never added again.
 
-**Fork dedup**: events that precede the last `session/end-seed` marker (fork/resume/replay seed history) are never counted, so forked sessions do not double-bill their parents' usage.
+**Fork dedup**: events inside the durable seed prefix (`inheritedEventCount`) are never counted, so forked sessions do not double-bill their parents' usage. `session/end-seed` markers only delimit resume/fork accounting epochs — resumed sessions keep every window of their own usage.
 
 **Timezone declaration**: day buckets and exports use **UTC** calendar days (`YYYY-MM-DD`); the heatmap subtitle declares the scope ("last 6 months · UTC").
 
@@ -84,7 +84,7 @@ Source is TypeScript (strict) in `src/`, built with esbuild; the `lib/` outputs 
 | `src/shared/contract.ts` | Host↔client wire contract (single source of truth) |
 | `cordis.patch.yml` | Bundle patch: inserts the `usage-stats` row into the profile composition |
 
-The host serves an `overview` endpoint through `ctx.connection.rpc.handle('/usage-stats', …, { authority: 'loopback' })`; the browser calls it via `rpc.call('/usage-stats', 'overview', …)`. The overview carries `coverage` (session-record totals and the main/subagent usage split, shown beneath the sessions KPI), `topSessions`, `providers`, plus the v0.1.0-shaped `days` / `totals` / `byModel` / `allTime`. Developed against DeepSeek Harness `0.1.0-rc.6`. Tests run on the Node built-in test runner (`npm test`); CI runs typecheck + build + test + the pack gate.
+The host serves an `overview` endpoint as an exact-path route on the shared `/api` transport (`ctx.connection.fetch.register('/api/usage-stats/overview', …)` — the connection plugin's route applies the Host/Origin fence and browser auth); the browser calls it via `rpc.call('/api', 'usage-stats/overview', …)`. The overview carries `coverage` (session-record totals and the main/subagent usage split, shown beneath the sessions KPI), `topSessions`, `providers`, plus the v0.1.0-shaped `days` / `totals` / `byModel` / `allTime`. Developed against DeepSeek Harness `0.1.5-rc.1`. Tests run on the Node built-in test runner (`npm test`); CI runs typecheck + build + test + the pack gate.
 
 ## License
 

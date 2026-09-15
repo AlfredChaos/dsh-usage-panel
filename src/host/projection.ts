@@ -8,9 +8,17 @@
 //
 // Accounting rules (all deliberate, see iteration-strategy §4.6):
 //  - Four DISJOINT buckets per DSH TokenUsage: input is uncached only.
-//  - Fork dedup: events with seq < the LAST session/end-seed are seed history
-//    (fork/resume/replay) and are never counted — our v0.1.0 seedLength
-//    correctness wall, preserved inside the projection.
+//  - Epoch accounting: the log is segmented by session/end-seed markers into
+//    epochs (one per resume/fork boundary). Every usage event lands in the
+//    epoch open at its seq; the fork-dedup decision is deferred to merge
+//    time, which knows header.seedLength — the only authoritative seed
+//    boundary. A marker delimits RESUME epochs too (the constructor appends
+//    one whenever a seed is supplied, including self-restore), so it can
+//    never gate counting inside the unit.
+//  - seedEnd (nullable) is a CALLER-PRESET authoritative boundary for the
+//    scan path, which owns the header: events with seq < seedEnd never reach
+//    any epoch. The unit itself never assigns it — registry folds leave it
+//    null and rely on merge-time epoch selection.
 //  - Model attribution: request/context.model base, request/header.config.model
 //    overrides (v0.1.0 semantic); provider tracked the same way.
 //  - Per-step replacement: assistant/chunk provisional usage accumulates per
@@ -41,7 +49,7 @@ const stepSchema = z.object({
   mode: z.enum(['provisional', 'authoritative']),
 })
 
-export const usagePanelSchema = z.object({
+const epochSchema = z.object({
   totals: bucketSchema,
   byModel: z.record(z.string(), bucketSchema),
   byDay: z.record(z.string(), z.record(z.string(), bucketSchema)),
@@ -50,6 +58,15 @@ export const usagePanelSchema = z.object({
   compactionTokens: z.number(),
   firstTime: z.number().nullable(),
   lastTime: z.number().nullable(),
+  // Seq of the session/end-seed marker that closed this epoch; null = open.
+  end: z.number().nullable(),
+})
+
+export const usagePanelSchema = z.object({
+  // Closed epochs in marker order, then the still-open accumulator.
+  epochs: z.array(epochSchema),
+  current: epochSchema,
+  // Caller-preset seed boundary (scan path only; see header comment).
   seedEnd: z.number().nullable(),
   currentModel: z.string(),
   currentProvider: z.string(),
@@ -59,6 +76,7 @@ export const usagePanelSchema = z.object({
 
 export type Buckets = z.infer<typeof bucketSchema>
 export type StepState = z.infer<typeof stepSchema>
+export type EpochState = z.infer<typeof epochSchema>
 export type UsagePanelState = z.infer<typeof usagePanelSchema>
 
 export const USAGE_PANEL_KEY = 'usagePanel'
@@ -71,7 +89,7 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
 
 const EMPTY: Buckets = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
 
-export function initState(): UsagePanelState {
+export function emptyEpoch(): EpochState {
   return {
     totals: { ...EMPTY },
     byModel: {},
@@ -81,6 +99,14 @@ export function initState(): UsagePanelState {
     compactionTokens: 0,
     firstTime: null,
     lastTime: null,
+    end: null,
+  }
+}
+
+export function initState(): UsagePanelState {
+  return {
+    epochs: [],
+    current: emptyEpoch(),
     seedEnd: null,
     currentModel: 'unknown',
     currentProvider: 'unknown',
@@ -118,53 +144,47 @@ function addIntoDay(
 }
 
 /**
- * Whether an event may be counted. The registry folds a cold log in ONE pass
- * (init + apply per event, no lookahead), so the unit arms itself: nothing is
- * counted until the LAST session/end-seed marker has been seen, and only
- * events at/after the marker's seq (live history) count. Seed events that
- * precede the marker in a cold fold are therefore never counted — the v0.1.0
- * seedLength correctness wall, preserved inside the projection.
+ * Whether an event may be counted. Only a caller-preset seedEnd gates
+ * anything (scan path, where header.seedLength is known); a registry fold
+ * leaves it null and counts everything — fork dedup happens later via
+ * merge-time epoch selection.
  */
 function isCounted(state: UsagePanelState, event: SessionEvent): boolean {
-  return state.seedEnd !== null && event.seq >= state.seedEnd
+  return state.seedEnd === null || event.seq >= state.seedEnd
 }
 
-function touchTime(state: UsagePanelState, time: number): UsagePanelState {
-  if (state.firstTime === null || time < state.firstTime || time > (state.lastTime ?? 0)) {
-    return {
-      ...state,
-      firstTime: state.firstTime === null ? time : Math.min(state.firstTime, time),
-      lastTime: state.lastTime === null ? time : Math.max(state.lastTime, time),
-    }
+/** Fold usage into an epoch's aggregates (pure). */
+function absorbUsage(ep: EpochState, b: Buckets, model: string, provider: string, time: number): EpochState {
+  const day = dayKeyUTC(time)
+  return {
+    ...ep,
+    totals: add(ep.totals, b),
+    byModel: addInto(ep.byModel, model, b),
+    byDay: addIntoDay(ep.byDay, day, model, b),
+    byProvider: addInto(ep.byProvider, provider, b),
+    firstTime: ep.firstTime === null ? time : Math.min(ep.firstTime, time),
+    lastTime: ep.lastTime === null ? time : Math.max(ep.lastTime, time),
   }
-  return state
 }
 
-/** Fold one step's buckets into the aggregates (pure; call once per step). */
+/** Fold one step's buckets into the open epoch (pure; call once per step). */
 function commitStep(state: UsagePanelState, key: string): UsagePanelState {
   const step = state.steps[key]
   if (!step) return state
+  const steps = { ...state.steps }
+  delete steps[key]
+  const openStep = state.openStep === key ? null : state.openStep
   const b = step.buckets
   if (b.input === 0 && b.output === 0 && b.cacheRead === 0 && b.cacheWrite === 0) {
     // Zero usage still folds nothing; drop the step bookkeeping only.
-    const steps = { ...state.steps }
-    delete steps[key]
-    return { ...state, steps, openStep: state.openStep === key ? null : state.openStep }
+    return { ...state, steps, openStep }
   }
-  const day = dayKeyUTC(step.lastTime)
-  const next: UsagePanelState = {
+  return {
     ...state,
-    totals: add(state.totals, b),
-    byModel: addInto(state.byModel, step.model, b),
-    byDay: addIntoDay(state.byDay, day, step.model, b),
-    byProvider: addInto(state.byProvider, step.provider, b),
-    firstTime: state.firstTime === null ? step.lastTime : Math.min(state.firstTime, step.lastTime),
-    lastTime: state.lastTime === null ? step.lastTime : Math.max(state.lastTime, step.lastTime),
-    steps: { ...state.steps },
-    openStep: state.openStep === key ? null : state.openStep,
+    current: absorbUsage(state.current, b, step.model, step.provider, step.lastTime),
+    steps,
+    openStep,
   }
-  delete next.steps[key]
-  return next
 }
 
 function commitOpenStep(state: UsagePanelState, incomingKey: string): UsagePanelState {
@@ -180,12 +200,55 @@ function commitOpenStep(state: UsagePanelState, incomingKey: string): UsagePanel
  * the registry contract). State is plain JSON (persisted-cache precondition).
  */
 export function applyEvent(state: UsagePanelState, event: SessionEvent): UsagePanelState {
+  // Logs written before dsh 0.1.5 may carry streamed chunks; the current
+  // event vocabulary dropped the type, so it is matched by string. The
+  // provisional usage accumulates into the step and is replaced by the
+  // authoritative assistant/message at commit.
+  if ((event.type as string) === 'assistant/chunk') {
+    if (!isCounted(state, event)) return state
+    const data = event.data as {
+      turn: number
+      step: number
+      chunk?: { type?: string; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number } }
+    }
+    const chunk = data.chunk
+    if (!chunk || chunk.type !== 'usage' || !chunk.usage) return state
+    const key = stepKey(data.turn, data.step)
+    const usage = chunk.usage
+    const b = {
+      input: Number(usage.inputTokens) || 0,
+      output: Number(usage.outputTokens) || 0,
+      cacheRead: Number(usage.cacheReadTokens) || 0,
+      cacheWrite: Number(usage.cacheWriteTokens) || 0,
+    }
+    let next = commitOpenStep(state, key)
+    const existing = next.steps[key]
+    const step: StepState = existing
+      ? { ...existing, buckets: add(existing.buckets, b), lastTime: event.time }
+      : {
+        buckets: b,
+        lastTime: event.time,
+        model: next.currentModel,
+        provider: next.currentProvider,
+        mode: 'provisional',
+      }
+    return {
+      ...next,
+      steps: { ...next.steps, [key]: step },
+      openStep: key,
+    }
+  }
   switch (event.type) {
     case 'session/end-seed': {
-      // Last marker wins: a preset (cold fold) or earlier marker must not be
-      // overwritten by an older one.
-      if (state.seedEnd !== null && event.seq <= state.seedEnd) return state
-      return { ...state, seedEnd: event.seq }
+      // Every marker closes the open epoch — markers delimit resume AND fork
+      // boundaries, so the unit never decides which prefix is foreign. Flush
+      // an open step first so its usage lands in the epoch it started in.
+      const flushed = state.openStep !== null ? commitStep(state, state.openStep) : state
+      return {
+        ...flushed,
+        epochs: [...flushed.epochs, { ...flushed.current, end: event.seq }],
+        current: emptyEpoch(),
+      }
     }
     case 'request/context': {
       const { model, provider } = event.data
@@ -205,34 +268,25 @@ export function applyEvent(state: UsagePanelState, event: SessionEvent): UsagePa
         currentProvider: cfg.provider || state.currentProvider,
       }
     }
-    case 'assistant/chunk': {
+    case 'assistant/attempt': {
       if (!isCounted(state, event)) return state
-      const chunk = event.data.chunk
-      if (!chunk || chunk.type !== 'usage' || !chunk.usage) return state
-      const key = stepKey(event.data.turn, event.data.step)
-      const usage = chunk.usage
-      const b = {
-        input: Number(usage.inputTokens) || 0,
-        output: Number(usage.outputTokens) || 0,
-        cacheRead: Number(usage.cacheReadTokens) || 0,
-        cacheWrite: Number(usage.cacheWriteTokens) || 0,
+      // A settled failed/retried/cancelled call: a distinct billed call whose
+      // preserved stream carries the usage chunks. Count every chunk (never
+      // replaced — a same-step retried message is a separate call).
+      let b: Buckets | null = null
+      for (const rec of event.data.stream ?? []) {
+        if (rec.type !== 'chunk' || rec.chunk.type !== 'usage' || !rec.chunk.usage) continue
+        const u = rec.chunk.usage
+        const uu = {
+          input: Number(u.inputTokens) || 0,
+          output: Number(u.outputTokens) || 0,
+          cacheRead: Number(u.cacheReadTokens) || 0,
+          cacheWrite: Number(u.cacheWriteTokens) || 0,
+        }
+        b = b ? add(b, uu) : uu
       }
-      let next = commitOpenStep(state, key)
-      const existing = next.steps[key]
-      const step: StepState = existing
-        ? { ...existing, buckets: add(existing.buckets, b), lastTime: event.time }
-        : {
-            buckets: b,
-            lastTime: event.time,
-            model: next.currentModel,
-            provider: next.currentProvider,
-            mode: 'provisional',
-          }
-      return {
-        ...next,
-        steps: { ...next.steps, [key]: step },
-        openStep: key,
-      }
+      if (!b) return state
+      return { ...state, current: absorbUsage(state.current, b, state.currentModel, state.currentProvider, event.time) }
     }
     case 'assistant/message': {
       if (!isCounted(state, event)) return state
@@ -269,7 +323,16 @@ export function applyEvent(state: UsagePanelState, event: SessionEvent): UsagePa
     }
     case 'llm/retry': {
       if (!isCounted(state, event)) return state
-      return touchTime({ ...state, retries: state.retries + 1 }, event.time)
+      const cur = state.current
+      return {
+        ...state,
+        current: {
+          ...cur,
+          retries: cur.retries + 1,
+          firstTime: cur.firstTime === null ? event.time : Math.min(cur.firstTime, event.time),
+          lastTime: cur.lastTime === null ? event.time : Math.max(cur.lastTime, event.time),
+        },
+      }
     }
     case 'compaction/summary': {
       if (!isCounted(state, event)) return state
@@ -283,16 +346,10 @@ export function applyEvent(state: UsagePanelState, event: SessionEvent): UsagePa
       }
       const model = event.data.model || state.currentModel
       const provider = event.data.provider || state.currentProvider
-      const day = dayKeyUTC(event.time)
+      const absorbed = absorbUsage(state.current, b, model, provider, event.time)
       return {
         ...state,
-        totals: add(state.totals, b),
-        byModel: addInto(state.byModel, model, b),
-        byDay: addIntoDay(state.byDay, day, model, b),
-        byProvider: addInto(state.byProvider, provider, b),
-        compactionTokens: state.compactionTokens + b.input + b.output + b.cacheRead + b.cacheWrite,
-        firstTime: state.firstTime === null ? event.time : Math.min(state.firstTime, event.time),
-        lastTime: state.lastTime === null ? event.time : Math.max(state.lastTime, event.time),
+        current: { ...absorbed, compactionTokens: absorbed.compactionTokens + b.input + b.output + b.cacheRead + b.cacheWrite },
       }
     }
     default:
@@ -301,44 +358,70 @@ export function applyEvent(state: UsagePanelState, event: SessionEvent): UsagePa
 }
 
 /**
- * Fold a full event list from init (cold read path / tests). Two-pass: the
- * LAST session/end-seed marker in stored history is the seed boundary
- * (doc: "Locate the LAST one in stored history"), so it is located first and
- * preset — a single forward pass would count seed events that precede the
- * marker. The registry's own lazy cold fold is single-pass (init + apply),
- * where the unit self-arms: nothing is counted until a marker has been seen.
+ * Fold a full event list from init (cold read path / tests). Single pass —
+ * markers split the log into epochs and every usage event lands in one; the
+ * fork-dedup decision is deferred to merge time via selectEpochs.
  */
 export function foldEvents(events: readonly SessionEvent[]): UsagePanelState {
-  let seedEnd: number | null = null
-  for (const event of events) {
-    if (event.type === 'session/end-seed') seedEnd = event.seq
-  }
-  let state = { ...initState(), seedEnd }
+  let state = initState()
   for (const event of events) state = applyEvent(state, event)
   return state
 }
 
-/** Sum a session's day buckets whose key >= cutoffKey (recent-30d window). */
-export function recentOf(value: UsagePanelState, cutoffKey: string): { totals: Buckets; byModel: Record<string, Buckets> } {
+/**
+ * The epochs whose usage belongs to THIS session, given the durable seed
+ * prefix length (header.seedLength ?? 0). An epoch closed by a marker at or
+ * before seedLength lies inside the inherited prefix (the fork boundary is
+ * always a marker position: construction appends one at seedLength unless the
+ * seed already ends with one — either way no epoch straddles the boundary).
+ * Resume-only sessions have seedLength 0 → every epoch kept; marker-less
+ * sessions fold into a single open epoch → kept.
+ */
+export function selectEpochs(value: UsagePanelState, seedLength: number): EpochState[] {
+  return [...value.epochs, value.current].filter((e) => e.end === null || e.end > seedLength)
+}
+
+/** Flatten epochs into one per-session usage view (pure). */
+export function flattenEpochs(epochs: readonly EpochState[]): Omit<EpochState, 'end'> {
+  const out = emptyEpoch()
+  for (const ep of epochs) {
+    out.totals = add(out.totals, ep.totals)
+    out.retries += ep.retries
+    out.compactionTokens += ep.compactionTokens
+    if (ep.firstTime !== null) out.firstTime = out.firstTime === null ? ep.firstTime : Math.min(out.firstTime, ep.firstTime)
+    if (ep.lastTime !== null) out.lastTime = out.lastTime === null ? ep.lastTime : Math.max(out.lastTime, ep.lastTime)
+    for (const model of Object.keys(ep.byModel)) out.byModel = addInto(out.byModel, model, ep.byModel[model]!)
+    for (const provider of Object.keys(ep.byProvider)) out.byProvider = addInto(out.byProvider, provider, ep.byProvider[provider]!)
+    for (const day of Object.keys(ep.byDay)) {
+      for (const model of Object.keys(ep.byDay[day]!)) out.byDay = addIntoDay(out.byDay, day, model, ep.byDay[day]![model]!)
+    }
+  }
+  return out
+}
+
+/** Sum day buckets across epochs whose key >= cutoffKey (recent-30d window). */
+export function recentOf(epochs: readonly EpochState[], cutoffKey: string): { totals: Buckets; byModel: Record<string, Buckets> } {
   const totals: Buckets = { ...EMPTY }
   const byModel: Record<string, Buckets> = {}
-  for (const day of Object.keys(value.byDay)) {
-    if (day < cutoffKey) continue
-    for (const model of Object.keys(value.byDay[day]!)) {
-      const b = value.byDay[day]![model]!
-      totals.input += b.input
-      totals.output += b.output
-      totals.cacheRead += b.cacheRead
-      totals.cacheWrite += b.cacheWrite
-      const cur = byModel[model]
-      byModel[model] = cur
-        ? {
+  for (const ep of epochs) {
+    for (const day of Object.keys(ep.byDay)) {
+      if (day < cutoffKey) continue
+      for (const model of Object.keys(ep.byDay[day]!)) {
+        const b = ep.byDay[day]![model]!
+        totals.input += b.input
+        totals.output += b.output
+        totals.cacheRead += b.cacheRead
+        totals.cacheWrite += b.cacheWrite
+        const cur = byModel[model]
+        byModel[model] = cur
+          ? {
             input: cur.input + b.input,
             output: cur.output + b.output,
             cacheRead: cur.cacheRead + b.cacheRead,
             cacheWrite: cur.cacheWrite + b.cacheWrite,
           }
-        : { ...b }
+          : { ...b }
+      }
     }
   }
   return { totals, byModel }
