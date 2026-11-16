@@ -96,6 +96,7 @@ npm pack --dry-run   # 发布前人工确认清单
   - `dsh plugin --profile <p> remove <pkg>` 会同时清 dependencies 和 `dsh.profile.bundles` 条目；`add` 会一并恢复。pnpm `file:` 依赖是**拷贝**不是 symlink（改代码需重新 add）；`link:` 才是真 symlink。
   - 第三方插件随宿主主版本漂移：`dsh-better-sidebar@0.12.x` 在 0.1.5 下因 `settingsNamespace` 导出缺失崩掉整个插件树，升 0.19.x（peer `^0.1.5-rc.1`）恢复。升级宿主后如插件树加载失败，先查各插件 peer 范围。
   - rc.6 写的旧 subagent 日志（`subagent/descriptor` v2）会被 0.1.5 replay 校验拒绝（`unsupported descriptor version 2; source v0 artifact remains unchanged`）——框架层数据兼容问题，靠 coverage 披露而非插件侧修复。
+- **`sessionQuery.readSession` 读冷会话时每次都会 `persistence.list()` 整个语料库**（读所有日志头）：逐会话调用是 O(N²)，约 1200 个会话一轮保鲜扫描要跑几分钟满 CPU，而且 `coldSnapshot` 每次都回写 projcache。投影路径因此每轮只 `sessionPersistence.list()` 一次拿各日志的 `revision`，按 revision + persistence `identity` 记住每个会话的结果（`src/host/collect.ts`），只重读 revision 变了的会话和活跃会话，读取走 `sessionQuery.observeSession`（stat 定位，不列语料库，不回写 projcache）；没有 `observeSession` 的宿主才退回 `readSession` + `coldSnapshot`。revision 只在同一个 persistence 实例内可比。
 - **`mergeSessionValue` 是纯函数**：返回值必须重新赋值（`a = mergeSessionValue(a, …)`），漏掉会静默丢数据——scan.ts 与 index.ts 都踩过。
 - **zod v4 的 `z.record` 签名变了**：`z.record(valueSchema)` 在 v4 里被当作 key schema；必须 `z.record(z.string(), valueSchema)`。
 - **`SessionId` 是品牌类型**：`readSession/readTitle/coldSnapshot` 拒绝裸 `string`；用 `header.id` 本体，别 `String()`。
