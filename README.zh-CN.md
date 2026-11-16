@@ -52,7 +52,7 @@ dsh plugin --profile web remove dsh-usage-panel
 
 Host 半聚合持久化会话日志：
 
-- **主路径（增量）**：注册一个会话投影（`ctx.sessionProjections`，带 `stateVersion` 校验），把每个已提交事件折叠进四个互斥桶 —— 未缓存输入 / 输出 / 缓存读 / 缓存写 —— 以及按模型、按 Provider、按天（UTC）的映射。checkpoint 落盘，重启与保鲜扫描几乎零回放。
+- **主路径（增量）**：注册一个会话投影（`ctx.sessionProjections`，带 `stateVersion` 校验），把每个已提交事件折叠进四个互斥桶 —— 未缓存输入 / 输出 / 缓存读 / 缓存写 —— 以及按模型、按 Provider、按天（UTC）的映射。checkpoint 落盘，重启几乎零回放；保鲜扫描每轮只列一次会话存储，仅重读存储版本（revision）自上一轮以来变化过的日志。
 - **回退路径（全量重扫）**：投影服务不可用时，同一套 reducer 通过只读 `sessionQuery` 服务重放每个会话日志。
 
 记账规则：`request/header` 与 `request/context` 记录模型（context 打底、header 覆盖）；该步骤的 `assistant/message` 用量**替换**流式暂记用量（同一步重试的消息不会重复累计）；`llm/retry` 事件只计重试次数、不计 Token；`compaction/summary` 用量归属其自身模型并单独披露；reasoning token 已含于 output，绝不重复相加。

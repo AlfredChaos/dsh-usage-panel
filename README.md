@@ -52,7 +52,7 @@ dsh plugin --profile web remove dsh-usage-panel
 
 The host half aggregates persisted session logs:
 
-- **Primary path (incremental)**: a session projection (registered through `ctx.sessionProjections`, `stateVersion`-checked) folds every committed event into four disjoint buckets — uncached input, output, cache read, cache write — plus per-model, per-provider and per-day (UTC) maps. Checkpoints are durable, so restarts and keep-warm passes cost almost no replay.
+- **Primary path (incremental)**: a session projection (registered through `ctx.sessionProjections`, `stateVersion`-checked) folds every committed event into four disjoint buckets — uncached input, output, cache read, cache write — plus per-model, per-provider and per-day (UTC) maps. Checkpoints are durable, so restarts cost almost no replay, and a keep-warm pass lists session storage once and re-reads only the logs whose storage revision changed since the previous pass.
 - **Fallback path (full rescan)**: when the projection services are unavailable, the same reducer replays every session log through the read-only `sessionQuery` service.
 
 Accounting rules: `request/header` and `request/context` events record the model (context base, header override); the step's `assistant/message` usage replaces streamed provisional usage (a retried same-step message never double-counts); `llm/retry` events are counted as retries, not tokens; `compaction/summary` usage is attributed to its own model and reported separately; reasoning tokens are already inside output and are never added again.

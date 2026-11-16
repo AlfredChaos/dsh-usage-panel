@@ -3,23 +3,25 @@
 // Data path: the sessionProjections persisted projection is the primary
 // source — every session's events are folded incrementally by the framework
 // (four disjoint buckets, fork dedup, stream/retry/compaction semantics) and
-// checkpoints are durable; scans aggregate cold snapshots, so a restart or
-// keep-warm pass costs ~zero replay. When the projection services are
+// checkpoints are durable. A pass lists persistence once and re-reads only
+// sessions whose log revision changed since the previous pass (collect.ts),
+// so a keep-warm pass over an unchanged corpus reads no logs. When the projection services are
 // unavailable the plugin fails soft to the v0.1.0 full rescan (same reducer).
 //
 // Reads are served with stale-while-revalidate: fresh for 10 minutes; older
 // payloads return instantly with `stale: true` while a background rescan
 // refreshes; the refresh button forces a synchronous scan. Read-only.
 import type { Context } from '@deepseek-ai/cordis'
-import type { SessionQueryEngine, SessionRecord } from '@deepseek-ai/dsh-session-query'
+import type { SessionQueryEngine } from '@deepseek-ai/dsh-session-query'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
 import type { SessionProjectionCache } from '@deepseek-ai/dsh-session-projection-cache'
 import { RPC_OVERVIEW, RPC_PATH, type CoverageStats, type Overview, type RpcResult } from '../shared/contract.ts'
 import { emptyAggregate, emptyOverview, finalizeOverview, mergeSessionValue, rankSessions } from './aggregate.ts'
 import { usagePanelProjectionDefinition } from './projection-unit.ts'
+import { createSessionCollector, type CollectPass, type SessionRead } from './collect.ts'
 import { scanFallback } from './scan.ts'
-import type { HostConnection, HostLlm, HostWorkspaceRegistry } from './types.ts'
+import type { HostConnection, HostLlm, HostSessionPersistence, HostWorkspaceRegistry } from './types.ts'
 
 export const name = 'dsh-usage-panel'
 export const inject = ['timer', 'connection']
@@ -102,6 +104,57 @@ export function apply(ctx: Context): void {
     return new Set((workspaceRegistry?.archivedSessionIds ?? []).map(String))
   }
 
+  // One persistence listing per pass gives every log's revision; the
+  // collector re-reads only sessions whose revision moved since last pass.
+  let persistence: HostSessionPersistence | undefined
+  ctx.inject(['sessionPersistence'], (pCtx) => {
+    const service = (pCtx as unknown as { sessionPersistence?: HostSessionPersistence }).sessionPersistence
+    persistence = service
+    pCtx.effect(() => () => {
+      if (persistence === service) persistence = undefined
+    })
+  })
+
+  // Hosts with observeSession read one log by `stat` without listing the
+  // corpus and without rewriting the projection cache; readSession lists
+  // every stored log per call, so it stays only as the fallback.
+  async function readUsage(id: SessionId): Promise<SessionRead> {
+    if (typeof sq!.observeSession === 'function') {
+      const observation = await sq!.observeSession(id)
+      try {
+        const values = observation.projections?.values
+        return {
+          value: values?.usagePanel,
+          inheritedEventCount: Number(observation.inheritedEventCount) || 0,
+          ...(values && 'title' in values ? { title: values.title ?? null } : {}),
+        }
+      } finally {
+        observation[Symbol.dispose]()
+      }
+    }
+    const snap = await sq!.readSession(id)
+    const projected = projCache!.coldSnapshot(snap.session, snap.inheritedEventCount, snap.events)
+    return {
+      value: projected.values.usagePanel,
+      inheritedEventCount: Number(snap.inheritedEventCount) || 0,
+      ...('title' in projected.values ? { title: projected.values.title ?? null } : {}),
+    }
+  }
+
+  const collectSessions = createSessionCollector({
+    listSessions: () => sq!.listSessions(),
+    listRevisions: async () => {
+      const service = persistence
+      if (!service || typeof service.list !== 'function') return undefined
+      const snapshots = await service.list()
+      return {
+        identity: service.identity ?? service,
+        revisions: new Map(snapshots.map((s) => [String(s.header.id), String(s.revision)])),
+      }
+    },
+    readSession: (id) => readUsage(id),
+  })
+
   async function scanProjection(now: number): Promise<Overview> {
     let a = emptyAggregate()
     const archived = archivedSet()
@@ -110,44 +163,31 @@ export function apply(ctx: Context): void {
     let sessionsFailed = 0
     let sessionsPending = 0
     const failures: string[] = []
-    let sessions: SessionRecord[] = []
+    const foldedTitles = new Map<string, string | null>()
+    let pass: CollectPass
     try {
-      sessions = await sq!.listSessions()
+      pass = await collectSessions()
     } catch (err) {
       logFailure('listSessions failed: ' + String((err as Error)?.message ?? err))
       return emptyOverview(now)
     }
-    for (const rec of sessions) {
-      const header = rec && rec.header
-      if (!header) {
-        sessionsTotal += 1
-        sessionsFailed += 1
-        continue
-      }
-      const id = header.id
+    for (const outcome of pass.outcomes) {
       sessionsTotal += 1
-      if (!rec.persisted) {
-        sessionsPending += 1
+      if (outcome.kind === 'pending') {
+        sessionsPending += 1 // not persisted yet, or cell not folded yet
         continue
       }
-      try {
-        // dsh ≥0.1.5: coldSnapshot takes the caller-supplied complete log
-        // (meta + inheritedEventCount + events) — read it via sessionQuery.
-        const snap = await sq!.readSession(id)
-        const projected = projCache!.coldSnapshot(snap.session, snap.inheritedEventCount, snap.events)
-        const value = projected.values.usagePanel
-        if (!value) {
-          sessionsPending += 1 // cell not folded yet (no events / cold)
-          continue
-        }
-        const depth = Number((header as { delegationDepth?: unknown }).delegationDepth) || 0
-        const inherited = Number(snap.inheritedEventCount) || 0
-        a = mergeSessionValue(a, value, id, now, depth, inherited, archived.has(String(id)))
-        sessionsOk += 1
-      } catch (err) {
+      if (outcome.kind === 'failed') {
         sessionsFailed += 1
-        if (failures.length < 3) failures.push(String((err as Error)?.message ?? err))
+        if (outcome.record?.header && failures.length < 3) failures.push(outcome.error)
+        continue
       }
+      const { header } = outcome.record
+      const { read } = outcome
+      const depth = Number((header as { delegationDepth?: unknown }).delegationDepth) || 0
+      a = mergeSessionValue(a, read.value, header.id, now, depth, read.inheritedEventCount, archived.has(String(header.id)))
+      if (read.title !== undefined) foldedTitles.set(String(header.id), read.title)
+      sessionsOk += 1
     }
     if (failures.length > 0) {
       logFailure(sessionsFailed + ' session(s) failed to read (first ' + failures.length + '): ' + failures.join(' | '))
@@ -155,6 +195,10 @@ export function apply(ctx: Context): void {
     const titles = new Map<string, string | null>()
     await Promise.all(
       rankSessions(a.sessions, 10).map(async (s) => {
+        if (foldedTitles.has(s.id)) {
+          titles.set(s.id, foldedTitles.get(s.id) ?? null)
+          return
+        }
         try {
           const t = await sq!.readTitle(s.id as SessionId)
           titles.set(s.id, t ? t.title : null)

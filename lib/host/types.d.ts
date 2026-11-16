@@ -33,6 +33,20 @@ export interface HostLlm {
     listProviders(): Promise<LlmProviderInfoLike[]> | LlmProviderInfoLike[];
 }
 /**
+ * `ctx.sessionPersistence` (optional): only the lightweight listing is used.
+ * `revision` is an opaque change token, comparable only within one service
+ * instance (`identity`) and one session id.
+ */
+export interface HostSessionPersistence {
+    readonly identity?: symbol;
+    list(): Promise<ReadonlyArray<{
+        readonly header: {
+            readonly id: string;
+        };
+        readonly revision: string;
+    }>>;
+}
+/**
  * `ctx.workspaceRegistry` (optional): the sidebar's archive authority.
  * `archivedSessionIds` are SessionId-branded strings ('session-<uuid>'),
  * same form as SessionRecord.header.id.
